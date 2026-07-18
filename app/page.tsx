@@ -4,12 +4,14 @@ import { useMemo, useState } from "react";
 import { computeT12Actuals, DEFAULT_INPUTS, DealInputs, hasT12Actuals, hydrateInputs, runUnderwriting, syncDetailToAggregates } from "@/lib/underwriting";
 import { DetailedLineItems } from "@/lib/detailedProforma";
 import { EMPTY_MARKET_COMPS, Extracted, ExtractionEntry, MarketComps, mergeExtractions, mergeMarketComps } from "@/lib/applyExtraction";
-import { buildScorecard, buildTopRisks, investmentThesis } from "@/lib/scorecard";
+import { buildScorecard, buildTopRisks } from "@/lib/scorecard";
+import { buildInvestmentThesis, buildRiskScorecard, buildFinalRecommendation, computeTrueNetYieldModel } from "@/lib/riskAnalysis";
 import { buildLoiNarrative } from "@/lib/loiNarrative";
 import { runScenarios, computeBreakEven } from "@/lib/scenarios";
 import { buildAssumptionsRegister } from "@/lib/assumptionsRegister";
 import { buildDdChecklist } from "@/lib/ddChecklist";
 import { computeWaterfall } from "@/lib/waterfall";
+import { buildFullReport, computeCapexAnalysis } from "@/lib/report";
 
 import Tabs, { TabName } from "@/components/Tabs";
 import CoverDashboard from "@/components/CoverDashboard";
@@ -30,6 +32,7 @@ import LoiOutputTab from "@/components/LoiOutputTab";
 import WaterfallTab from "@/components/WaterfallTab";
 import MyDealsTab from "@/components/MyDealsTab";
 import AiAssistantTab, { ChatMessage } from "@/components/AiAssistantTab";
+import ReportModal from "@/components/ReportModal";
 
 export default function Home() {
   const [tab, setTab] = useState<TabName>("Dashboard");
@@ -43,6 +46,7 @@ export default function Home() {
   const [currentDealId, setCurrentDealId] = useState<string | null>(null);
   const [dealsRefreshToken, setDealsRefreshToken] = useState(0);
   const [assistantMessages, setAssistantMessages] = useState<ChatMessage[]>([]);
+  const [showReport, setShowReport] = useState(false);
 
   const result = useMemo(() => runUnderwriting(inputs), [inputs]);
   const scorecard = useMemo(
@@ -53,7 +57,6 @@ export default function Home() {
     () => buildTopRisks(inputs, result.debt, result.returns, result.proforma),
     [inputs, result]
   );
-  const thesis = useMemo(() => investmentThesis(inputs, result.returns, scorecard), [inputs, result, scorecard]);
   const narrative = useMemo(() => buildLoiNarrative(inputs, result.debt, result.returns), [inputs, result]);
   const scenarios = useMemo(() => runScenarios(inputs), [inputs]);
   const breakEven = useMemo(() => computeBreakEven(inputs, result.proforma), [inputs, result]);
@@ -61,6 +64,41 @@ export default function Home() {
   const ddItems = useMemo(() => buildDdChecklist(inputs.ddPeriodDays), [inputs.ddPeriodDays]);
   const t12 = useMemo(() => (hasT12Actuals(inputs) ? computeT12Actuals(inputs) : null), [inputs]);
   const waterfall = useMemo(() => computeWaterfall(inputs, result.debt, result.returns), [inputs, result]);
+  const thesis = useMemo(
+    () => buildInvestmentThesis(inputs, result.debt, result.returns, result.proforma[0].noi),
+    [inputs, result]
+  );
+  const yieldModel = useMemo(() => computeTrueNetYieldModel(inputs), [inputs]);
+  const riskRows = useMemo(
+    () => buildRiskScorecard(inputs, result.debt, result.returns, yieldModel, marketComps),
+    [inputs, result, yieldModel, marketComps]
+  );
+  const recommendation = useMemo(
+    () => buildFinalRecommendation(riskRows, result.returns, inputs),
+    [riskRows, result, inputs]
+  );
+  const capex = useMemo(() => computeCapexAnalysis(inputs), [inputs]);
+  const reportMarkdown = useMemo(
+    () =>
+      buildFullReport({
+        inputs,
+        debt: result.debt,
+        proforma: result.proforma,
+        returns: result.returns,
+        sourcesAndUses: result.sourcesAndUses,
+        yieldModel,
+        riskRows,
+        recommendation,
+        waterfall,
+        scenarios,
+        breakEven,
+        marketComps,
+        assumptions,
+        thesis,
+        capex,
+      }),
+    [inputs, result, yieldModel, riskRows, recommendation, waterfall, scenarios, breakEven, marketComps, assumptions, thesis, capex]
+  );
 
   const assistantSnapshot = useMemo(
     () => ({
@@ -72,13 +110,16 @@ export default function Home() {
       returns: result.returns,
       scorecard,
       topRisks: risks,
+      trueNetYieldModel: yieldModel,
+      riskScorecard: riskRows,
+      recommendation,
       breakEven,
       scenarios: scenarios.map((s) => ({ name: s.name, returns: s.returns })),
       sensitivityGrid: result.sensitivity,
       waterfall,
       marketComps,
     }),
-    [inputs, result, t12, scorecard, risks, breakEven, scenarios, waterfall, marketComps]
+    [inputs, result, t12, scorecard, risks, yieldModel, riskRows, recommendation, breakEven, scenarios, waterfall, marketComps]
   );
 
   function handleChange(patch: Partial<DealInputs>) {
@@ -151,7 +192,7 @@ export default function Home() {
   }
 
   return (
-    <div className="max-w-7xl mx-auto flex min-h-screen">
+    <div className="app-root max-w-7xl mx-auto flex min-h-screen">
       <aside className="w-64 shrink-0 border-r border-cardBorder px-4 py-6 sticky top-0 h-screen overflow-y-auto">
         <div className="mb-6 px-1">
           <h1 className="text-lg font-bold leading-tight">CRE Underwriter</h1>
@@ -178,6 +219,12 @@ export default function Home() {
               className="text-sm font-medium text-silver hover:text-white px-2"
             >
               New Deal
+            </button>
+            <button
+              onClick={() => setShowReport(true)}
+              className="text-sm font-medium px-4 py-2 rounded-md border border-cardBorder text-white hover:border-ink/50"
+            >
+              Full Report
             </button>
             <button
               onClick={handleSave}
@@ -248,7 +295,9 @@ export default function Home() {
         <MarketCompsTab comps={marketComps} onChange={(patch) => setMarketComps((prev) => ({ ...prev, ...patch }))} />
       )}
 
-      {tab === "Scorecard & Risk" && <ScorecardTab metrics={scorecard} risks={risks} thesis={thesis} />}
+      {tab === "Scorecard & Risk" && (
+        <ScorecardTab metrics={scorecard} thesis={thesis} yieldModel={yieldModel} riskRows={riskRows} recommendation={recommendation} />
+      )}
 
       {tab === "DD Checklist" && <DdChecklistTab items={ddItems} ddPeriodDays={inputs.ddPeriodDays} />}
 
@@ -256,6 +305,8 @@ export default function Home() {
 
         {tab === "LOI Output" && <LoiOutputTab narrative={narrative} inputs={inputs} onChange={handleChange} />}
       </main>
+
+      {showReport && <ReportModal markdown={reportMarkdown} onClose={() => setShowReport(false)} />}
     </div>
   );
 }
